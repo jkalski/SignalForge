@@ -1,0 +1,118 @@
+from sqlalchemy import (
+    Column, String, Numeric, BigInteger, Integer,
+    Boolean, DateTime, Text, ARRAY, UniqueConstraint, Index
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase
+from datetime import datetime
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Candle(Base):
+    __tablename__ = "candles"
+
+    id        = Column(BigInteger, primary_key=True, autoincrement=True)
+    symbol    = Column(String(20),  nullable=False)
+    timeframe = Column(String(5),   nullable=False)  # 1m,5m,15m,1h,1d,1w
+    source    = Column(String(20),  nullable=False)  # stooq, alpaca
+    ts        = Column(DateTime,    nullable=False)
+    open      = Column(Numeric(12, 4), nullable=False)
+    high      = Column(Numeric(12, 4), nullable=False)
+    low       = Column(Numeric(12, 4), nullable=False)
+    close     = Column(Numeric(12, 4), nullable=False)
+    volume    = Column(BigInteger)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "timeframe", "source", "ts", name="uq_candle"),
+        Index("idx_candles_symbol_tf_ts", "symbol", "timeframe", "ts"),
+    )
+
+
+class Zone(Base):
+    __tablename__ = "zones"
+
+    id             = Column(String(80), primary_key=True)
+    symbol         = Column(String(20), nullable=False)
+    timeframe      = Column(String(5),  nullable=False)
+    zone_type      = Column(String(10), nullable=False)  # demand, supply
+    price_low      = Column(Numeric(12, 4), nullable=False)
+    price_high     = Column(Numeric(12, 4), nullable=False)
+    strength_score = Column(Numeric(5, 4))
+    touch_count    = Column(Integer, default=1)
+    is_active      = Column(Boolean, default=True)
+    first_formed_at = Column(DateTime)
+    last_tested_at  = Column(DateTime)
+    invalidated_at  = Column(DateTime)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_zones_symbol_tf_active", "symbol", "timeframe", "is_active"),
+    )
+
+
+class Signal(Base):
+    __tablename__ = "signals"
+
+    id                 = Column(String(80), primary_key=True)
+    symbol             = Column(String(20), nullable=False)
+    timeframe          = Column(String(5),  nullable=False)
+    direction          = Column(String(5),  nullable=False)  # long, short
+    setup_type         = Column(String(60), nullable=False)
+    entry_price        = Column(Numeric(12, 4))
+    stop_price         = Column(Numeric(12, 4))
+    target_price       = Column(Numeric(12, 4))
+    r_multiple         = Column(Numeric(6, 2))
+    prob_success       = Column(Numeric(5, 4))
+    status             = Column(String(20), default="active")
+    zone_id            = Column(String(80))
+    context_snapshot   = Column(Text)       # JSON string (SQLite-safe)
+    created_at         = Column(DateTime, default=datetime.utcnow)
+    horizon_expires_at = Column(DateTime)
+    closed_at          = Column(DateTime)
+    close_price        = Column(Numeric(12, 4))
+    realized_r         = Column(Numeric(6, 2))
+
+    __table_args__ = (
+        Index("idx_signals_symbol_status", "symbol", "status"),
+        Index("idx_signals_created_at", "created_at"),
+    )
+
+
+class ProbabilityHistory(Base):
+    __tablename__ = "probability_history"
+
+    id                = Column(BigInteger, primary_key=True, autoincrement=True)
+    setup_type        = Column(String(60), nullable=False)
+    timeframe         = Column(String(5),  nullable=False)
+    symbol            = Column(String(20))  # NULL = all symbols aggregated
+    window_start      = Column(DateTime, nullable=False)
+    window_end        = Column(DateTime, nullable=False)
+    sample_count      = Column(Integer, nullable=False)
+    win_count         = Column(Integer, nullable=False)
+    win_rate          = Column(Numeric(5, 4))
+    avg_r_won         = Column(Numeric(6, 2))
+    avg_r_lost        = Column(Numeric(6, 2))
+    expected_r        = Column(Numeric(6, 2))
+    calibration_score = Column(Numeric(5, 4))
+    computed_at       = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_prob_history_setup_tf", "setup_type", "timeframe", "computed_at"),
+    )
+
+
+class IngestRun(Base):
+    __tablename__ = "ingest_runs"
+
+    id          = Column(BigInteger, primary_key=True, autoincrement=True)
+    run_type    = Column(String(30), nullable=False)  # stooq_daily, alpaca_intraday, etc.
+    status      = Column(String(10), nullable=False)  # ok, error, partial
+    symbols     = Column(Text)       # comma-separated string (SQLite-safe)
+    rows_written = Column(Integer)
+    error_msg   = Column(Text)
+    started_at  = Column(DateTime, nullable=False)
+    finished_at = Column(DateTime)
