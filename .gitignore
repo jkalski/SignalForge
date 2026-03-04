@@ -1,8 +1,30 @@
-﻿venv/
+﻿# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment variables
 .env
 .env.*
+
+# Database files
+*.db
+signalforge.db
+
+# OS files
 .DS_Store
+
+# Python tooling caches
 .pytest_cache/
 .mypy_cache/
+
+# Local AI tooling
+.claude/
+
+# Misc
+*.log

@@ -1,8 +1,7 @@
 from sqlalchemy import (
     Column, String, Numeric, BigInteger, Integer,
-    Boolean, DateTime, Text, ARRAY, UniqueConstraint, Index
+    Boolean, DateTime, Text, UniqueConstraint, Index
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase
 from datetime import datetime
 
@@ -14,7 +13,7 @@ class Base(DeclarativeBase):
 class Candle(Base):
     __tablename__ = "candles"
 
-    id        = Column(BigInteger, primary_key=True, autoincrement=True)
+    id        = Column(Integer, primary_key=True, autoincrement=True)
     symbol    = Column(String(20),  nullable=False)
     timeframe = Column(String(5),   nullable=False)  # 1m,5m,15m,1h,1d,1w
     source    = Column(String(20),  nullable=False)  # stooq, alpaca
@@ -29,6 +28,8 @@ class Candle(Base):
     __table_args__ = (
         UniqueConstraint("symbol", "timeframe", "source", "ts", name="uq_candle"),
         Index("idx_candles_symbol_tf_ts", "symbol", "timeframe", "ts"),
+        Index("idx_candles_symbol_tf_src_ts", "symbol", "timeframe", "source", "ts"),
+        Index("idx_candles_ts", "ts"),
     )
 
 
@@ -80,12 +81,10 @@ class Signal(Base):
         Index("idx_signals_symbol_status", "symbol", "status"),
         Index("idx_signals_created_at", "created_at"),
     )
-
-
 class ProbabilityHistory(Base):
     __tablename__ = "probability_history"
 
-    id                = Column(BigInteger, primary_key=True, autoincrement=True)
+    id                = Column(Integer, primary_key=True, autoincrement=True)
     setup_type        = Column(String(60), nullable=False)
     timeframe         = Column(String(5),  nullable=False)
     symbol            = Column(String(20))  # NULL = all symbols aggregated
@@ -108,7 +107,7 @@ class ProbabilityHistory(Base):
 class IngestRun(Base):
     __tablename__ = "ingest_runs"
 
-    id          = Column(BigInteger, primary_key=True, autoincrement=True)
+    id          = Column(Integer, primary_key=True, autoincrement=True)
     run_type    = Column(String(30), nullable=False)  # stooq_daily, alpaca_intraday, etc.
     status      = Column(String(10), nullable=False)  # ok, error, partial
     symbols     = Column(Text)       # comma-separated string (SQLite-safe)
