@@ -63,6 +63,7 @@ class Signal(Base):
     timeframe          = Column(String(5),  nullable=False)
     direction          = Column(String(5),  nullable=False)  # long, short
     setup_type         = Column(String(60), nullable=False)
+    strategy           = Column(String(40))
     entry_price        = Column(Numeric(12, 4))
     stop_price         = Column(Numeric(12, 4))
     target_price       = Column(Numeric(12, 4))
@@ -81,6 +82,61 @@ class Signal(Base):
         Index("idx_signals_symbol_status", "symbol", "status"),
         Index("idx_signals_created_at", "created_at"),
     )
+
+
+class SignalOutcome(Base):
+    __tablename__ = "signal_outcomes"
+
+    id                  = Column(String(120), primary_key=True)  # "{signal_id}_{horizon_bars}"
+    signal_id           = Column(String(80),  nullable=False)
+    symbol              = Column(String(20),  nullable=False)
+    timeframe           = Column(String(5),   nullable=False)
+    source              = Column(String(20))
+    signal_ts           = Column(DateTime,    nullable=False)
+    horizon_bars        = Column(Integer,     nullable=False)
+    entry_price         = Column(Numeric(12, 4))
+    exit_ts             = Column(DateTime)
+    exit_price          = Column(Numeric(12, 4))
+    return_pct          = Column(Numeric(10, 6))  # signed, direction-aware
+    max_favorable_pct   = Column(Numeric(10, 6))  # MFE over horizon
+    max_adverse_pct     = Column(Numeric(10, 6))  # MAE over horizon
+    created_at          = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_signal_outcomes_signal_id", "signal_id"),
+        Index("idx_signal_outcomes_symbol_tf_ts", "symbol", "timeframe", "signal_ts"),
+    )
+
+
+class Setup(Base):
+    __tablename__ = "setups"
+
+    id            = Column(String(160), primary_key=True)  # "{run_id}_{symbol}_{timeframe}_{source}_{ts_tag}"
+    run_id        = Column(Integer,     nullable=False)
+    symbol        = Column(String(20),  nullable=False)
+    timeframe     = Column(String(5),   nullable=False)
+    source        = Column(String(20))
+    ts            = Column(DateTime,    nullable=False)
+    close         = Column(Numeric(12, 4))
+    ema_20        = Column(Numeric(12, 4))
+    ema_50        = Column(Numeric(12, 4))
+    rsi_14        = Column(Numeric(6, 2))
+    atr_14        = Column(Numeric(12, 4))
+    score_raw     = Column(Numeric(12, 4))
+    score         = Column(Numeric(12, 6))
+    distance_pct  = Column(Numeric(8, 4))
+    current_state = Column(String(10))
+    trigger_type  = Column(String(10))  # "golden" | "death" | None
+    created_at    = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_setups_run_id",        "run_id"),
+        Index("idx_setups_symbol",        "symbol"),
+        Index("idx_setups_ts",            "ts"),
+        Index("idx_setups_score",         "score"),
+    )
+
+
 class ProbabilityHistory(Base):
     __tablename__ = "probability_history"
 
@@ -115,3 +171,22 @@ class IngestRun(Base):
     error_msg   = Column(Text)
     started_at  = Column(DateTime, nullable=False)
     finished_at = Column(DateTime)
+
+
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+
+    id                   = Column(Integer, primary_key=True, autoincrement=True)
+    started_at           = Column(DateTime, nullable=False)
+    finished_at          = Column(DateTime)
+    timeframe            = Column(String(5),  nullable=False)
+    source               = Column(String(20))
+    scanned              = Column(Integer)
+    candidates_considered = Column(Integer)
+    signals_created      = Column(Integer)
+    status               = Column(String(10), nullable=False)  # ok, error
+    error                = Column(Text)
+
+    __table_args__ = (
+        Index("idx_agent_runs_started_at", "started_at"),
+    )

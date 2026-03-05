@@ -11,6 +11,7 @@ from backend.db.session import get_db
 from backend.db.models import Candle
 from backend.config import settings
 from backend.marketdata.yahoo import fetch_yahoo_bars, YAHOO_INTERVAL_MAP
+from backend.marketdata.universe import SYMBOLS
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -301,50 +302,40 @@ def ingest_alpaca(
     return {"inserted": inserted, "skipped": skipped}
 
 
-@router.post("/yahoo")
-def ingest_yahoo(
-    symbol: str = Query(..., description="Ticker, e.g. AAPL"),
-    timeframe: str = Query("1h", description="One of 1m, 5m, 15m, 1h, 1d"),
-    period: Optional[str] = Query(None, description="yfinance period: 5d,1mo,3mo,6mo,1y,2y (default based on timeframe)"),
-    start: Optional[str] = Query(None, description="ISO8601 start date, e.g. 2024-01-01"),
-    end: Optional[str] = Query(None, description="ISO8601 end date, e.g. 2024-12-31"),
-    max_bars: Optional[int] = Query(None, ge=1, le=100000, description="Cap total bars fetched"),
-    db: Session = Depends(get_db),
-):
-    if timeframe not in YAHOO_INTERVAL_MAP:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Yahoo supports timeframes: {list(YAHOO_INTERVAL_MAP)}",
-        )
+def _ingest_yahoo_one(
+    db: Session,
+    sym_upper: str,
+    timeframe: str,
+    period: Optional[str],
+    start: Optional[str],
+    end: Optional[str],
+    max_bars: Optional[int],
+) -> dict:
+    """Fetch and store Yahoo bars for one symbol. Returns result dict; raises on error."""
+    import math
 
-    sym_upper = symbol.upper()
-    started_at = datetime.utcnow()
+    def _finite(v) -> bool:
+        try:
+            return math.isfinite(float(v))
+        except (TypeError, ValueError):
+            return False
 
-    try:
-        bars = fetch_yahoo_bars(
-            symbol=sym_upper,
-            timeframe=timeframe,
-            period=period,
-            start=start,
-            end=end,
-            max_bars=max_bars,
-        )
-    except Exception as e:
-        db.add(IngestRun(
-            run_type=f"yahoo_{timeframe}",
-            status="error",
-            symbols=sym_upper,
-            rows_written=0,
-            error_msg=str(e),
-            started_at=started_at,
-            finished_at=datetime.utcnow(),
-        ))
-        db.commit()
-        raise HTTPException(status_code=500, detail=f"Yahoo fetch error: {e}")
+    bars = fetch_yahoo_bars(
+        symbol=sym_upper,
+        timeframe=timeframe,
+        period=period,
+        start=start,
+        end=end,
+        max_bars=max_bars,
+    )
+
+    # Drop bars with any non-finite OHLC (Yahoo sometimes emits NaN on bad/partial bars)
+    bars = [
+        b for b in bars
+        if _finite(b["open"]) and _finite(b["high"]) and _finite(b["low"]) and _finite(b["close"])
+    ]
 
     if not bars:
-        # Yahoo intraday lookback is limited (1m≤7d, 5m/15m≤60d, 1h≤730d).
-        # Return a hint so callers can retry with a smaller period.
         suggested = {
             "1m": "5d", "5m": "60d", "15m": "60d", "1h": "6mo", "1d": "2y"
         }.get(timeframe, "1mo")
@@ -392,33 +383,104 @@ def ingest_yahoo(
         ))
         inserted += 1
 
+    db.commit()
+    return {"inserted": inserted, "skipped": skipped}
+
+
+@router.post("/yahoo")
+def ingest_yahoo(
+    symbol: str = Query(..., description="Ticker, e.g. AAPL"),
+    timeframe: str = Query("1h", description="One of 1m, 5m, 15m, 1h, 1d"),
+    period: Optional[str] = Query(None, description="yfinance period: 5d,1mo,3mo,6mo,1y,2y (default based on timeframe)"),
+    start: Optional[str] = Query(None, description="ISO8601 start date, e.g. 2024-01-01"),
+    end: Optional[str] = Query(None, description="ISO8601 end date, e.g. 2024-12-31"),
+    max_bars: Optional[int] = Query(None, ge=1, le=100000, description="Cap total bars fetched"),
+    db: Session = Depends(get_db),
+):
+    if timeframe not in YAHOO_INTERVAL_MAP:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Yahoo supports timeframes: {list(YAHOO_INTERVAL_MAP)}",
+        )
+
+    sym_upper = symbol.upper()
+    started_at = datetime.utcnow()
+
     try:
-        db.commit()
+        result = _ingest_yahoo_one(db, sym_upper, timeframe, period, start, end, max_bars)
     except Exception as e:
         db.rollback()
         db.add(IngestRun(
             run_type=f"yahoo_{timeframe}",
             status="error",
             symbols=sym_upper,
-            rows_written=inserted,
+            rows_written=0,
             error_msg=str(e),
             started_at=started_at,
             finished_at=datetime.utcnow(),
         ))
         db.commit()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Yahoo fetch error: {e}")
 
     db.add(IngestRun(
         run_type=f"yahoo_{timeframe}",
         status="ok",
         symbols=sym_upper,
-        rows_written=inserted,
+        rows_written=result["inserted"],
         started_at=started_at,
         finished_at=datetime.utcnow(),
     ))
     db.commit()
 
-    return {"inserted": inserted, "skipped": skipped}
+    return result
+
+
+@router.post("/yahoo/universe")
+def ingest_yahoo_universe(
+    timeframe: str = Query("1h", description="One of 1m, 5m, 15m, 1h, 1d"),
+    period: Optional[str] = Query(None, description="yfinance period: 5d,1mo,3mo,6mo,1y,2y"),
+    start: Optional[str] = Query(None, description="ISO8601 start date, e.g. 2024-01-01"),
+    end: Optional[str] = Query(None, description="ISO8601 end date, e.g. 2024-12-31"),
+    db: Session = Depends(get_db),
+):
+    """Ingest Yahoo bars for every symbol in the universe list."""
+    if timeframe not in YAHOO_INTERVAL_MAP:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Yahoo supports timeframes: {list(YAHOO_INTERVAL_MAP)}",
+        )
+
+    started_at = datetime.utcnow()
+    total_inserted = 0
+    total_skipped = 0
+    errors: list = []
+
+    for symbol in SYMBOLS:
+        try:
+            result = _ingest_yahoo_one(db, symbol, timeframe, period, start, end, None)
+            total_inserted += result["inserted"]
+            total_skipped += result["skipped"]
+        except Exception as e:
+            db.rollback()
+            errors.append({"symbol": symbol, "error": str(e)})
+
+    db.add(IngestRun(
+        run_type=f"yahoo_{timeframe}_universe",
+        status="ok" if not errors else "partial",
+        symbols=",".join(SYMBOLS),
+        rows_written=total_inserted,
+        error_msg=("; ".join(f"{e['symbol']}: {e['error']}" for e in errors) or None),
+        started_at=started_at,
+        finished_at=datetime.utcnow(),
+    ))
+    db.commit()
+
+    return {
+        "symbols": len(SYMBOLS),
+        "inserted": total_inserted,
+        "skipped": total_skipped,
+        "errors": errors,
+    }
 
 
 @router.get("/runs")

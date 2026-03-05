@@ -8,6 +8,8 @@ from backend.api.routes.features import router as features_router
 from backend.api.routes.signals_simple import router as signals_router
 from backend.api.routes.scan import router as scan_router
 from backend.api.routes.build import router as build_router
+from backend.api.routes.performance import router as performance_router
+from backend.api.routes.setups import router as setups_router
 
 app = FastAPI(title="Trading App API")
 
@@ -18,6 +20,8 @@ app.include_router(features_router)
 app.include_router(signals_router)
 app.include_router(scan_router)
 app.include_router(build_router)
+app.include_router(performance_router)
+app.include_router(setups_router)
 
 
 @app.on_event("startup")
