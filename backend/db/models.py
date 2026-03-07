@@ -126,7 +126,15 @@ class Setup(Base):
     score         = Column(Numeric(12, 6))
     distance_pct  = Column(Numeric(8, 4))
     current_state = Column(String(10))
-    trigger_type  = Column(String(10))  # "golden" | "death" | None
+    trigger_type  = Column(String(10))  # short event code, e.g. "brk_up"
+    # Institutional-lite scalar columns (queryable without parsing JSON)
+    setup_type       = Column(String(20))     # full event type, e.g. "breakout_up"
+    confluence_score = Column(Numeric(6, 2))  # 0–100 confluence score
+    vol_spike        = Column(Boolean)
+    htf_aligned      = Column(Boolean)
+    signal_status    = Column(String(10))     # "active" | "watchlist"
+    # Rich JSON payload (event details, zones, VWAP, reasons, data_quality)
+    details          = Column(Text)
     created_at    = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
@@ -134,6 +142,7 @@ class Setup(Base):
         Index("idx_setups_symbol",        "symbol"),
         Index("idx_setups_ts",            "ts"),
         Index("idx_setups_score",         "score"),
+        Index("idx_setups_signal_status", "signal_status"),
     )
 
 
@@ -184,6 +193,10 @@ class AgentRun(Base):
     scanned              = Column(Integer)
     candidates_considered = Column(Integer)
     signals_created      = Column(Integer)
+    zones_htf_count      = Column(Integer)
+    zones_ltf_count      = Column(Integer)
+    events_detected_count = Column(Integer)
+    valid_setups_count   = Column(Integer)
     status               = Column(String(10), nullable=False)  # ok, error
     error                = Column(Text)
 

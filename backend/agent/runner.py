@@ -34,12 +34,29 @@ _TRIGGER_SHORT: Dict[str, str] = {
     "breakdown_down": "brk_down",
     "bounce_up":      "bnc_up",
     "reject_down":    "rej_down",
+    "sweep_up":       "swp_up",
+    "sweep_down":     "swp_dn",
 }
 
 # Parallel workers for the scan phase.
 # Each worker owns its own DB session; SQLAlchemy's default pool handles up to
 # pool_size(5) + max_overflow(10) = 15 simultaneous connections safely.
 _SCAN_WORKERS = 8
+
+# LTF → HTF timeframe mapping used for MTF enrichment.
+# Coarser timeframe provides structural context (zones + bias) for the scanner.
+_HTF_MAP: Dict[str, str] = {
+    "1m":  "15m",
+    "5m":  "1h",
+    "15m": "4h",
+    "1h":  "4h",
+    "4h":  "1d",
+    "1d":  "1w",
+}
+
+# How many HTF bars to fetch.  200 bars gives ~10 months of daily history,
+# ~33 months of 4h history — enough for meaningful zone detection.
+_HTF_LOOKBACK = 200
 
 
 def run_agent(
@@ -64,7 +81,8 @@ def run_agent(
 
     Returns dict with:
         status, scanned, candidates_considered, signals_created,
-        zones_detected, scan_time_ms
+        zones_detected, zones_htf_count, zones_ltf_count,
+        events_detected_count, valid_setups_count, scan_time_ms
     """
     started_at = datetime.now(UTC)
     universe   = symbols or SYMBOLS
@@ -106,15 +124,18 @@ def run_agent(
         results: List[Dict[str, Any]] = [r for r in raw if r is not None]
 
         # ── 2. Aggregate scan metrics ─────────────────────────────────────────
-        zones_detected = sum(r.get("zones_detected", 0) for r in results)
+        zones_detected        = sum(r.get("zones_detected",  0) for r in results)
+        zones_htf_count       = sum(r.get("zones_htf_count", 0) for r in results)
+        zones_ltf_count       = sum(r.get("zones_ltf_count", 0) for r in results)
+        events_detected_count = len(results)  # symbols that produced an event
 
         logger.info(
-            "scan complete | symbols=%d | with_events=%d | zones=%d | %.0fms",
-            len(universe), len(results), zones_detected, scan_time_ms,
+            "scan complete | symbols=%d | with_events=%d | zones_ltf=%d | zones_htf=%d | %.0fms",
+            len(universe), len(results), zones_ltf_count, zones_htf_count, scan_time_ms,
         )
 
-        # ── 3. Rank by confidence desc, take top_n ────────────────────────────
-        results.sort(key=lambda r: r["confidence"], reverse=True)
+        # ── 3. Rank by confluence_score desc, take top_n ──────────────────────
+        results.sort(key=lambda r: r.get("confluence_score", 0), reverse=True)
         candidates = results[:top_n]
 
         # ── 4. Persist top candidates as Setup rows ───────────────────────────
@@ -125,6 +146,12 @@ def run_agent(
             setup_id = f"{run.id}_{c['symbol']}_{timeframe}_{src}_{ts_tag}"
 
             if db.get(Setup, setup_id) is None:
+                dq_setup = c.get("data_quality") or {}
+                htf_bias_val = c.get("htf_bias", "neutral")
+                htf_aligned_flag = (
+                    htf_bias_val in ("bullish", "bearish")
+                    and bool(c.get("mtf_aligned", True))
+                )
                 db.add(Setup(
                     id            = setup_id,
                     run_id        = run.id,
@@ -142,14 +169,40 @@ def run_agent(
                     distance_pct  = c["distance_pct"],
                     current_state = c["trend"],
                     trigger_type  = _TRIGGER_SHORT.get(c["event_type"], c["event_type"][:10]),
+                    # Institutional-lite scalar columns
+                    setup_type       = c["event_type"],
+                    confluence_score = c.get("confluence_score"),
+                    vol_spike        = c.get("vol_spike"),
+                    htf_aligned      = htf_aligned_flag,
+                    signal_status    = c.get("signal_status"),
+                    # Rich JSON payload
+                    details          = json.dumps({
+                        "event_type":             c["event_type"],
+                        "zone_center":            c.get("zone_center"),
+                        "zone_touches":           c.get("zone_touches"),
+                        "zones_ltf_count":        c.get("zones_ltf_count"),
+                        "zones_htf_count":        c.get("zones_htf_count"),
+                        "htf_bias":               c.get("htf_bias"),
+                        "near_htf_zone":          c.get("near_htf_zone"),
+                        "mtf_aligned":            c.get("mtf_aligned"),
+                        "vwap_session_dist_pct":  c.get("vwap_session_dist_pct"),
+                        "vwap_anchored_dist_pct": c.get("vwap_anchored_dist_pct"),
+                        "confluence_score":       c.get("confluence_score"),
+                        "confluence_reasons":     c.get("confluence_reasons"),
+                        "vol_spike":              c.get("vol_spike"),
+                        "vol_ratio":              c.get("vol_ratio"),
+                        "ema_confirms":           c.get("ema_confirms"),
+                        "signal_status":          c.get("signal_status"),
+                        "data_quality":           dq_setup,
+                    }),
                     created_at    = datetime.now(UTC),
                 ))
 
-        # ── 5. Generate Signal rows for valid (gated) setups ──────────────────
+        # ── 5. Generate Signal rows for active (all-gates-pass) setups ───────
         signals_created = 0
 
         for c in candidates:
-            if not c["signal_valid"]:
+            if c.get("signal_status") != "active":
                 continue
 
             event_type = c["event_type"]
@@ -160,6 +213,7 @@ def run_agent(
             signal_id  = f"{c['symbol']}_{timeframe}_{ts_tag}_{event_type}"
 
             if db.get(Signal, signal_id) is None:
+                dq = c.get("data_quality") or {}
                 db.add(Signal(
                     id               = signal_id,
                     symbol           = c["symbol"],
@@ -173,34 +227,53 @@ def run_agent(
                     r_multiple       = R_MULTIPLE,
                     status           = "active",
                     context_snapshot = json.dumps({
-                        "event_type":   event_type,
-                        "zone_center":  c["zone_center"],
-                        "zone_touches": c["zone_touches"],
-                        "vol_spike":    c["vol_spike"],
-                        "vol_ratio":    c["vol_ratio"],
-                        "trend":        c["trend"],
-                        "ema_confirms": c["ema_confirms"],
-                        "ema_20":       c["ema_20"],
-                        "ema_50":       c["ema_50"],
-                        "rsi_14":       c["rsi_14"],
-                        "atr_14":       c["atr_14"],
-                        "confidence":   c["confidence"],
-                        "source":       source,
+                        "event_type":              event_type,
+                        "zone_center":             c["zone_center"],
+                        "zone_touches":            c["zone_touches"],
+                        "vol_spike":               c["vol_spike"],
+                        "vol_ratio":               c["vol_ratio"],
+                        "trend":                   c["trend"],
+                        "ema_confirms":            c["ema_confirms"],
+                        "ema_20":                  c["ema_20"],
+                        "ema_50":                  c["ema_50"],
+                        "rsi_14":                  c["rsi_14"],
+                        "atr_14":                  c["atr_14"],
+                        "confidence":              c["confidence"],
+                        "confluence_score":        c.get("confluence_score"),
+                        "confluence_reasons":      c.get("confluence_reasons"),
+                        "signal_status":           c.get("signal_status"),
+                        "htf_bias":                c.get("htf_bias"),
+                        "mtf_aligned":             c.get("mtf_aligned"),
+                        "near_htf_zone":           c.get("near_htf_zone"),
+                        "zones_ltf_count":         c.get("zones_ltf_count"),
+                        "zones_htf_count":         c.get("zones_htf_count"),
+                        "vwap_session_dist_pct":   c.get("vwap_session_dist_pct"),
+                        "vwap_anchored_dist_pct":  c.get("vwap_anchored_dist_pct"),
+                        "data_quality":            dq,
+                        "source":                  source,
                     }),
                     created_at = datetime.now(UTC),
                 ))
                 signals_created += 1
                 logger.info(
-                    "signal | %s | %s | %s | zones=%d | conf=%.2f",
+                    "signal | %s | %s | %s | zones=%d | score=%.1f",
                     c["symbol"], event_type, direction,
-                    c["zone_touches"], c["confidence"],
+                    c["zone_touches"], c.get("confluence_score", 0),
                 )
 
         # ── 6. Finalise run record and commit ─────────────────────────────────
+        valid_setups_count = sum(
+            1 for c in candidates if c.get("signal_status") == "active"
+        )
+
         run.finished_at           = datetime.now(UTC)
         run.scanned               = len(universe)
         run.candidates_considered = len(candidates)
         run.signals_created       = signals_created
+        run.zones_htf_count       = zones_htf_count
+        run.zones_ltf_count       = zones_ltf_count
+        run.events_detected_count = events_detected_count
+        run.valid_setups_count    = valid_setups_count
         run.status                = "ok"
         db.commit()
 
@@ -214,7 +287,11 @@ def run_agent(
             "scanned":               len(universe),
             "candidates_considered": len(candidates),
             "signals_created":       signals_created,
-            "zones_detected":        zones_detected,
+            "zones_detected":        zones_detected,       # backward compat alias
+            "zones_htf_count":       zones_htf_count,
+            "zones_ltf_count":       zones_ltf_count,
+            "events_detected_count": events_detected_count,
+            "valid_setups_count":    valid_setups_count,
             "scan_time_ms":          scan_time_ms,
         }
 
@@ -262,24 +339,43 @@ def _scan_one_symbol(
         if not candles:
             return None
 
+        # Fetch HTF candles for MTF enrichment (same symbol + source, coarser TF).
+        htf_tf      = _HTF_MAP.get(timeframe)
+        htf_candles = (
+            _fetch_candles(db, symbol, htf_tf, source, _HTF_LOOKBACK)
+            if htf_tf else []
+        )
+
         result = run_structure_pipeline(
             candles,
-            symbol    = symbol,
-            timeframe = timeframe,
-            source    = source,
+            symbol      = symbol,
+            timeframe   = timeframe,
+            source      = source,
+            htf_candles = htf_candles or None,
         )
         elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
 
         if result is not None:
             result["_scan_ms"] = elapsed_ms
+            # Enrich data_quality with HTF availability metadata.
+            dq = result.get("data_quality") or {}
+            dq["htf_timeframe"]  = htf_tf
+            dq["htf_bars_count"] = len(htf_candles)
+            dq["htf_last_ts"]    = htf_candles[-1]["ts"] if htf_candles else None
+            dq["htf_provider"]   = source or "unknown"
+            result["data_quality"] = dq
             logger.debug(
-                "%-6s | %-15s | zones=%-2d | vol=%-5s | trend=%-7s | conf=%.2f | %dms",
+                "%-6s | %-15s | zones=%-2d | htf_zones=%d | vol=%-5s | trend=%-7s | conf=%.2f | %dms",
                 symbol, result["event_type"], result["zones_detected"],
+                result["zones_htf_count"],
                 result["vol_spike"], result["trend"],
                 result["confidence"], elapsed_ms,
             )
         else:
-            logger.debug("%-6s | no event | %dms", symbol, elapsed_ms)
+            logger.debug(
+                "%-6s | no event | htf_bars=%d | %dms",
+                symbol, len(htf_candles), elapsed_ms,
+            )
 
         return result
 
@@ -373,7 +469,10 @@ if __name__ == "__main__":
 
     print(f"[agent] status:                {result['status']}")
     print(f"[agent] scanned:               {result['scanned']}")
-    print(f"[agent] zones_detected:        {result['zones_detected']}")
+    print(f"[agent] events_detected_count: {result['events_detected_count']}")
+    print(f"[agent] zones_ltf_count:       {result['zones_ltf_count']}")
+    print(f"[agent] zones_htf_count:       {result['zones_htf_count']}")
     print(f"[agent] candidates_considered: {result['candidates_considered']}")
+    print(f"[agent] valid_setups_count:    {result['valid_setups_count']}")
     print(f"[agent] signals_created:       {result['signals_created']}")
     print(f"[agent] scan_time_ms:          {result['scan_time_ms']}")

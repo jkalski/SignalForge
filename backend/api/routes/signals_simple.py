@@ -57,12 +57,13 @@ def get_simple_signal(
 
         signal_id = None
 
-        if result is not None and result["signal_valid"]:
+        if result is not None and result.get("signal_status") == "active":
             ts     = result["ts"]
             ts_tag = ts.strftime("%Y%m%dT%H%M%S") if isinstance(ts, datetime) else str(ts)
             signal_id = f"{sym}_{timeframe}_{ts_tag}_{result['event_type']}"
 
             if db.get(Signal, signal_id) is None:
+                dq = result.get("data_quality") or {}
                 db.add(Signal(
                     id               = signal_id,
                     symbol           = sym,
@@ -76,19 +77,30 @@ def get_simple_signal(
                     r_multiple       = R_MULTIPLE,
                     status           = "active",
                     context_snapshot = json.dumps({
-                        "event_type":   result["event_type"],
-                        "zone_center":  result["zone_center"],
-                        "zone_touches": result["zone_touches"],
-                        "vol_spike":    result["vol_spike"],
-                        "vol_ratio":    result["vol_ratio"],
-                        "trend":        result["trend"],
-                        "ema_confirms": result["ema_confirms"],
-                        "ema_20":       result["ema_20"],
-                        "ema_50":       result["ema_50"],
-                        "rsi_14":       result["rsi_14"],
-                        "atr_14":       result["atr_14"],
-                        "confidence":   result["confidence"],
-                        "source":       source,
+                        "event_type":             result["event_type"],
+                        "zone_center":            result["zone_center"],
+                        "zone_touches":           result["zone_touches"],
+                        "vol_spike":              result["vol_spike"],
+                        "vol_ratio":              result["vol_ratio"],
+                        "trend":                  result["trend"],
+                        "ema_confirms":           result["ema_confirms"],
+                        "ema_20":                 result["ema_20"],
+                        "ema_50":                 result["ema_50"],
+                        "rsi_14":                 result["rsi_14"],
+                        "atr_14":                 result["atr_14"],
+                        "confidence":             result["confidence"],
+                        "confluence_score":       result.get("confluence_score"),
+                        "confluence_reasons":     result.get("confluence_reasons"),
+                        "signal_status":          result.get("signal_status"),
+                        "htf_bias":               result.get("htf_bias"),
+                        "mtf_aligned":            result.get("mtf_aligned"),
+                        "near_htf_zone":          result.get("near_htf_zone"),
+                        "zones_ltf_count":        result.get("zones_ltf_count"),
+                        "zones_htf_count":        result.get("zones_htf_count"),
+                        "vwap_session_dist_pct":  result.get("vwap_session_dist_pct"),
+                        "vwap_anchored_dist_pct": result.get("vwap_anchored_dist_pct"),
+                        "data_quality":           dq,
+                        "source":                 source,
                     }),
                     created_at = datetime.utcnow(),
                 ))
@@ -99,11 +111,12 @@ def get_simple_signal(
             direction_label = {"long": "BUY", "short": "SELL"}.get(
                 result["direction"], "NONE"
             )
+            is_active = result.get("signal_status") == "active"
             return {
                 # Legacy fields (same keys, structure-pipeline values)
                 "symbol":     sym,
                 "timeframe":  timeframe,
-                "signal":     direction_label if result["signal_valid"] else "NONE",
+                "signal":     direction_label if is_active else "NONE",
                 "trigger":    result["event_type"],
                 "signal_id":  signal_id,
                 "ts":         result["ts"],
@@ -126,7 +139,19 @@ def get_simple_signal(
                 "trend":        result["trend"],
                 "ema_confirms": result["ema_confirms"],
                 "confidence":   result["confidence"],
-                "signal_valid": result["signal_valid"],
+                "signal_valid": result["signal_valid"],   # legacy gate (preserved)
+                # Institutional-lite fields
+                "signal_status":          result.get("signal_status"),
+                "confluence_score":       result.get("confluence_score"),
+                "confluence_reasons":     result.get("confluence_reasons"),
+                "htf_bias":               result.get("htf_bias"),
+                "mtf_aligned":            result.get("mtf_aligned"),
+                "near_htf_zone":          result.get("near_htf_zone"),
+                "zones_ltf_count":        result.get("zones_ltf_count"),
+                "zones_htf_count":        result.get("zones_htf_count"),
+                "vwap_session_dist_pct":  result.get("vwap_session_dist_pct"),
+                "vwap_anchored_dist_pct": result.get("vwap_anchored_dist_pct"),
+                "data_quality":           result.get("data_quality"),
             }
 
         # No structural event detected on this symbol's last bar.
@@ -156,6 +181,18 @@ def get_simple_signal(
             "ema_confirms": False,
             "confidence":   0.0,
             "signal_valid": False,
+            # Institutional-lite fields
+            "signal_status":          None,
+            "confluence_score":       None,
+            "confluence_reasons":     [],
+            "htf_bias":               None,
+            "mtf_aligned":            None,
+            "near_htf_zone":          None,
+            "zones_ltf_count":        None,
+            "zones_htf_count":        None,
+            "vwap_session_dist_pct":  None,
+            "vwap_anchored_dist_pct": None,
+            "data_quality":           None,
         }
 
     finally:
