@@ -46,10 +46,10 @@ import numpy as np
 import pandas as pd
 
 from backend.features.indicators import compute_features
-from backend.indicators.pivots import find_pivots
+from backend.indicators.pivots import find_pivots, adaptive_pivot_order
 from backend.indicators.volume import add_volume_signals
 from backend.indicators.trend import add_trend_filter
-from backend.indicators.zones import Zone, build_zones_from_pivots
+from backend.indicators.zones import Zone, build_zones_from_pivots, invalidate_broken_zones
 from backend.indicators.vwap import (
     add_session_vwap,
     add_anchored_vwap,
@@ -64,6 +64,15 @@ from backend.indicators.mtf import (
 from backend.signals.structure_signals import detect_breakout_or_bounce
 from backend.signals.liquidity import detect_liquidity_sweeps
 from backend.signals.scoring import score_setup
+from backend.indicators.daily_levels import get_daily_levels
+from backend.signals.fvg import detect_fvg
+from backend.signals.vwap_signals import detect_vwap_reclaim
+from backend.signals.orb import detect_orb
+from backend.signals.market_structure import detect_bos
+from backend.signals.divergence import detect_rsi_divergence
+from backend.signals.gap import detect_gap
+from backend.signals.bar_patterns import detect_inside_bar, detect_outside_bar, detect_ath_breakout
+from backend.ml.predictor import get_predictor
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +93,34 @@ R_MULTIPLE      = round(ATR_TARGET_MULT / ATR_STOP_MULT, 2)  # 2.0
 
 # Event type → trade direction (includes sweep events)
 _DIRECTION: Dict[str, str] = {
-    "breakout_up":    "long",
-    "bounce_up":      "long",
-    "sweep_down":     "long",    # swept below support, closed above → long
-    "breakdown_down": "short",
-    "reject_down":    "short",
-    "sweep_up":       "short",   # swept above resistance, closed below → short
+    "breakout_up":         "long",
+    "bounce_up":           "long",
+    "sweep_down":          "long",    # swept below support, closed above → long
+    "breakdown_down":      "short",
+    "reject_down":         "short",
+    "sweep_up":            "short",   # swept above resistance, closed below → short
+    # New signal types
+    "fvg_long":            "long",
+    "fvg_short":           "short",
+    "vwap_reclaim_long":   "long",
+    "vwap_reclaim_short":  "short",
+    "orb_long":            "long",
+    "orb_short":           "short",
+    "bos_up":              "long",
+    "bos_down":            "short",
+    "choch_up":            "long",
+    "choch_down":          "short",
+    "gap_fade_long":            "long",
+    "gap_fade_short":           "short",
+    "gap_go_long":              "long",
+    "gap_go_short":             "short",
+    "ath_breakout_long":        "long",
+    "inside_bar_long":          "long",
+    "inside_bar_short":         "short",
+    "double_inside_bar_long":   "long",
+    "double_inside_bar_short":  "short",
+    "outside_bar_long":         "long",
+    "outside_bar_short":        "short",
 }
 
 
@@ -164,8 +195,9 @@ def run_structure_pipeline(
     data_quality = _assess_data_quality(df, timeframe, source)
     volume_ok    = data_quality["volume_ok"]
 
-    # ── Step 4: pivot detection ──────────────────────────────────────────────
-    df = find_pivots(df, order=_PIVOT_ORDER)
+    # ── Step 4: pivot detection (adaptive order based on current volatility) ──
+    pivot_order = adaptive_pivot_order(atr, close)
+    df = find_pivots(df, order=pivot_order)
 
     # ── Step 5: volume signals ───────────────────────────────────────────────
     df = add_volume_signals(df)
@@ -175,9 +207,18 @@ def run_structure_pipeline(
 
     # ── Step 7: LTF zone clustering ──────────────────────────────────────────
     zone_tol  = atr * _ZONE_ATR_MULT
-    ltf_zones = build_zones_from_pivots(df, zone_tol=zone_tol, min_touches=_MIN_TOUCHES)
+    ltf_zones = build_zones_from_pivots(df, zone_tol=zone_tol, min_touches=_MIN_TOUCHES, atr=atr)
     if not ltf_zones:
         return None
+    ltf_zones = invalidate_broken_zones(ltf_zones, df, atr)
+    ltf_zones = [z for z in ltf_zones if z.is_valid]
+    if not ltf_zones:
+        return None
+
+    # ── Step 7.5: merge PDH/PDL zones ────────────────────────────────────────
+    pdh_pdl = get_daily_levels(df, zone_tol)
+    if pdh_pdl:
+        ltf_zones = ltf_zones + pdh_pdl
 
     # ── Step 8: HTF zone clustering + bias ───────────────────────────────────
     htf_zones: List[Zone] = []
@@ -202,10 +243,13 @@ def run_structure_pipeline(
         if _raw_htf_atr and math.isfinite(_raw_htf_atr) and _raw_htf_atr > 0:
             htf_atr = _raw_htf_atr
 
-        htf_df   = find_pivots(htf_df, order=_PIVOT_ORDER)
+        htf_pivot_order = adaptive_pivot_order(htf_atr, float(htf_df["close"].iloc[-1]))
+        htf_df   = find_pivots(htf_df, order=htf_pivot_order)
         htf_df   = add_trend_filter(htf_df)
         htf_tol  = htf_atr * _ZONE_ATR_MULT
-        htf_zones = build_zones_from_pivots(htf_df, zone_tol=htf_tol, min_touches=_MIN_TOUCHES)
+        htf_zones = build_zones_from_pivots(htf_df, zone_tol=htf_tol, min_touches=_MIN_TOUCHES, atr=htf_atr)
+        htf_zones = invalidate_broken_zones(htf_zones, htf_df, htf_atr)
+        htf_zones = [z for z in htf_zones if z.is_valid]
         htf_bias  = get_htf_bias(htf_df)
 
         if htf_zones:
@@ -213,6 +257,8 @@ def run_structure_pipeline(
             alignment = align_zones(htf_zones, ltf_zones, tol=mtf_tol)
 
     # ── Step 9: VWAP (volume-gated) ──────────────────────────────────────────
+    vwap_session           = None
+    vwap_anchored          = None
     vwap_session_dist_pct  = None
     vwap_anchored_dist_pct = None
 
@@ -220,6 +266,7 @@ def run_structure_pipeline(
         df = add_session_vwap(df)
         last_vwap_session = float(df["vwap_session"].iloc[-1])
         if math.isfinite(last_vwap_session) and close > 0:
+            vwap_session          = round(last_vwap_session, 4)
             vwap_session_dist_pct = round(abs(close - last_vwap_session) / close * 100, 4)
 
         anchor_idx = get_last_major_pivot_index(
@@ -233,6 +280,7 @@ def run_structure_pipeline(
             df = add_anchored_vwap(df, anchor_idx=anchor_idx)
             last_avwap = float(df["vwap_anchored"].iloc[-1])
             if math.isfinite(last_avwap) and close > 0:
+                vwap_anchored          = round(last_avwap, 4)
                 vwap_anchored_dist_pct = round(abs(close - last_avwap) / close * 100, 4)
 
     # ── Step 10: pre-select nearby zones (performance cap) ───────────────────
@@ -241,13 +289,40 @@ def run_structure_pipeline(
     # ── Step 11: event detection — sweeps first, then structural ─────────────
     event: Optional[Dict] = None
 
-    sweep = detect_liquidity_sweeps(df, nearby, zone_tol, lookback_bars=_SWEEP_LOOKBACK)
-    if sweep is not None:
-        event = sweep
-    else:
-        struct = detect_breakout_or_bounce(df, nearby, zone_tol)
-        if struct is not None:
-            event = struct
+    # Gap fades run first — a gap-open reversal is more specific than a generic
+    # bounce/sweep and should not be overridden by zone-based signals.
+    gap = detect_gap(df, atr)
+    if gap is not None and gap["type"] in ("gap_fade_long", "gap_fade_short"):
+        event = gap
+
+    if event is None:
+        event = detect_ath_breakout(df, zone_tol)
+
+    if event is None:
+        sweep = detect_liquidity_sweeps(df, nearby, zone_tol, lookback_bars=_SWEEP_LOOKBACK)
+        if sweep is not None:
+            event = sweep
+        else:
+            struct = detect_breakout_or_bounce(df, nearby, zone_tol)
+            if struct is not None:
+                event = struct
+
+    # Extended detectors — run only when no primary event found yet.
+    if event is None:
+        event = detect_fvg(df, zone_tol, atr)
+    if event is None:
+        event = detect_vwap_reclaim(df, atr)
+    if event is None:
+        event = detect_bos(df, zone_tol)
+    if event is None:
+        event = detect_orb(df, atr, zone_tol)
+    if event is None:
+        event = detect_outside_bar(df)
+    if event is None:
+        event = detect_inside_bar(df)
+    # Gap continuations are lowest priority (similar confidence to breakouts).
+    if event is None and gap is not None:
+        event = gap
 
     if event is None:
         return None
@@ -270,6 +345,13 @@ def run_structure_pipeline(
     ema_confirms = bool(
         (direction == "long"  and trend_bull) or
         (direction == "short" and trend_bear)
+    )
+
+    # RSI divergence — confluence gate only (does not block the signal).
+    rsi_div = detect_rsi_divergence(df)
+    rsi_divergence_aligned = bool(
+        (rsi_div == "bullish" and direction == "long") or
+        (rsi_div == "bearish" and direction == "short")
     )
 
     # HTF filter — always True when no HTF data (graceful degradation).
@@ -305,20 +387,47 @@ def run_structure_pipeline(
     triggering_zone = _find_zone_by_center(nearby, event["zone_center"])
 
     confluence_result = score_setup(
-        event                 = event,
-        zone                  = triggering_zone,
-        atr14                 = atr,
-        vol_ratio             = vol_ratio,
-        ltf_trend_aligned     = ltf_trend_aligned,
-        htf_trend_aligned     = htf_trend_aligned,
-        vwap_session_dist_pct = vwap_session_dist_pct,
+        event                  = event,
+        zone                   = triggering_zone,
+        atr14                  = atr,
+        vol_ratio              = vol_ratio,
+        ltf_trend_aligned      = ltf_trend_aligned,
+        htf_trend_aligned      = htf_trend_aligned,
+        vwap_session_dist_pct  = vwap_session_dist_pct,
         vwap_anchored_dist_pct = vwap_anchored_dist_pct,
-        htf_bias_aligned      = (htf_trend_aligned is True),
-        near_htf_zone         = near_htf,
-        ref_ts                = df["ts"].iloc[-1],
+        htf_bias_aligned       = (htf_trend_aligned is True),
+        near_htf_zone          = near_htf,
+        ref_ts                 = df["ts"].iloc[-1],
+        rsi_divergence_aligned = rsi_divergence_aligned,
     )
     confluence_score   = confluence_result["score"]
     confluence_reasons = confluence_result["reasons"]
+
+    # ── Step 13b: ML probability score ───────────────────────────────────────
+    # Returns None when model hasn't been trained yet — pipeline continues
+    # using confluence_score as the primary ranking signal until then.
+    _ml_signal = {
+        "event_type":            event["type"],
+        "direction":             direction,
+        "signal_status":         signal_status,
+        "zone_touches":          event["touches"],
+        "zones_ltf_count":       len(ltf_zones),
+        "zones_htf_count":       len(htf_zones),
+        "distance_pct":          round(abs(close - event["zone_center"]) / close * 100, 4) if event.get("zone_center") else 0.0,
+        "vol_ratio":             vol_ratio,
+        "vol_spike":             vol_spike,
+        "ema_confirms":          ema_confirms,
+        "atr_14":                atr,
+        "trend":                 trend,
+        "htf_bias":              htf_bias,
+        "mtf_aligned":           mtf_aligned,
+        "near_htf_zone":         near_htf,
+        "vwap_session_dist_pct":  vwap_session_dist_pct,
+        "vwap_anchored_dist_pct": vwap_anchored_dist_pct,
+        "confluence_score":      confluence_score,
+        "confluence_reasons":    confluence_reasons,
+    }
+    ml_probability = get_predictor().score(_ml_signal)
 
     # Legacy confidence score (preserved for backward compat with scan.py).
     zone_touches = event["touches"]
@@ -381,13 +490,20 @@ def run_structure_pipeline(
         "near_htf_zone":   near_htf,
         "mtf_aligned":     mtf_aligned,
         # VWAP
+        "vwap_session":           vwap_session,
+        "vwap_anchored":          vwap_anchored,
         "vwap_session_dist_pct":  vwap_session_dist_pct,
         "vwap_anchored_dist_pct": vwap_anchored_dist_pct,
+        # Zones (serialized for JSON consumers)
+        "zones_ltf": _serialize_zones(ltf_zones),
+        "zones_htf": _serialize_zones(htf_zones),
         # Confluence scoring
         "confluence_score":   confluence_score,
         "confluence_reasons": confluence_reasons,
         # Signal status
         "signal_status":   signal_status,
+        # ML probability (None until model is trained)
+        "ml_probability":  ml_probability,
         # Data quality
         "data_quality":    data_quality,
     }
@@ -417,6 +533,22 @@ def _find_zone_by_center(zones: List[Zone], center: float) -> Zone:
         if abs(z.center - center) < 1e-6:
             return z
     return zones[0]
+
+
+def _serialize_zones(zones: List[Zone]) -> List[Dict[str, Any]]:
+    """Convert Zone dataclass objects to JSON-serializable dicts."""
+    return [
+        {
+            "kind":       z.kind,
+            "price_low":  z.low,
+            "price_high": z.high,
+            "center":     z.center,
+            "touches":    z.touches,
+            "first_ts":   z.first_ts.isoformat(),
+            "last_ts":    z.last_ts.isoformat(),
+        }
+        for z in zones
+    ]
 
 
 def _assess_data_quality(

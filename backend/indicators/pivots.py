@@ -15,7 +15,20 @@ within the window [i - order, i + order].
 
 Edge rows within `order` bars of either end cannot be pivots and are
 set to False.
+
+Adaptive order
+--------------
+``adaptive_pivot_order()`` computes the lookback window dynamically from
+the current ATR relative to price.  In high-volatility regimes the window
+widens so only significant structural pivots qualify; in calm regimes it
+tightens to capture smaller but still valid swings.
+
+Formula: max(5, int(atr_period * volatility_scalar))
+where volatility_scalar = (atr / price) / base_atr_pct, capped at 2.0
+to prevent unreasonably wide windows on extremely volatile instruments.
 """
+
+import math
 
 import numpy as np
 import pandas as pd
@@ -25,6 +38,41 @@ try:
     _SCIPY_AVAILABLE = True
 except ImportError:
     _SCIPY_AVAILABLE = False
+
+
+def adaptive_pivot_order(
+    atr: float,
+    price: float,
+    atr_period: int = 14,
+    base_atr_pct: float = 0.005,
+) -> int:
+    """
+    Compute a pivot lookback order that adapts to current volatility.
+
+    Uses: ``max(5, int(atr_period * volatility_scalar))``
+    where ``volatility_scalar = (atr / price) / base_atr_pct``, capped at 2.0.
+
+    Parameters
+    ----------
+    atr : float
+        Current ATR14 of the symbol.
+    price : float
+        Current close price (> 0).
+    atr_period : int, default 14
+        ATR lookback period — used as the base multiplier.
+    base_atr_pct : float, default 0.005
+        ATR / price ratio considered "normal" volatility (0.5 %).
+        Instruments with ATR % above this get a wider pivot window.
+
+    Returns
+    -------
+    int
+        Pivot order in [5, max(5, atr_period * 2)].
+    """
+    if price <= 0 or not math.isfinite(atr) or atr <= 0:
+        return max(5, atr_period // 2)
+    volatility_scalar = min((atr / price) / base_atr_pct, 2.0)
+    return max(5, int(atr_period * volatility_scalar))
 
 
 def find_pivots(df: pd.DataFrame, order: int = 3) -> pd.DataFrame:

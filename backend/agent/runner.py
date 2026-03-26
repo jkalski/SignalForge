@@ -25,17 +25,41 @@ from backend.marketdata.universe import SYMBOLS
 from backend.agent.pipeline import run_structure_pipeline, R_MULTIPLE
 from backend.db.models import AgentRun, Candle, Setup, Signal
 from backend.db.session import SessionLocal
+from backend.probability.aggregator import get_win_rate
+from backend.notifications.dispatcher import dispatch_signal
+from backend.signals.explain import format_alert
 
 logger = logging.getLogger(__name__)
 
-# Setup.trigger_type is VARCHAR(10) — use short codes for new event types.
+# Setup.trigger_type is VARCHAR(10) — map every event type to a ≤10-char code.
 _TRIGGER_SHORT: Dict[str, str] = {
-    "breakout_up":    "brk_up",
-    "breakdown_down": "brk_down",
-    "bounce_up":      "bnc_up",
-    "reject_down":    "rej_down",
-    "sweep_up":       "swp_up",
-    "sweep_down":     "swp_dn",
+    "breakout_up":           "brk_up",
+    "breakdown_down":        "brk_down",
+    "bounce_up":             "bnc_up",
+    "reject_down":           "rej_down",
+    "sweep_up":              "swp_up",
+    "sweep_down":            "swp_dn",
+    "bos_up":                "bos_up",
+    "bos_down":              "bos_down",
+    "choch_up":              "choch_up",
+    "choch_down":            "choch_down",
+    "fvg_long":              "fvg_long",
+    "fvg_short":             "fvg_short",
+    "vwap_reclaim_long":     "vwap_r_lng",
+    "vwap_reclaim_short":    "vwap_r_sht",
+    "orb_long":              "orb_long",
+    "orb_short":             "orb_short",
+    "gap_fade_long":         "gp_fade_l",
+    "gap_fade_short":        "gp_fade_s",
+    "gap_go_long":           "gap_go_lng",
+    "gap_go_short":          "gap_go_sht",
+    "ath_breakout_long":     "ath_brk_l",
+    "inside_bar_long":       "ib_long",
+    "inside_bar_short":      "ib_short",
+    "double_inside_bar_long":  "dib_long",
+    "double_inside_bar_short": "dib_short",
+    "outside_bar_long":      "ob_long",
+    "outside_bar_short":     "ob_short",
 }
 
 # Parallel workers for the scan phase.
@@ -185,8 +209,12 @@ def run_agent(
                         "htf_bias":               c.get("htf_bias"),
                         "near_htf_zone":          c.get("near_htf_zone"),
                         "mtf_aligned":            c.get("mtf_aligned"),
+                        "vwap_session":           c.get("vwap_session"),
+                        "vwap_anchored":          c.get("vwap_anchored"),
                         "vwap_session_dist_pct":  c.get("vwap_session_dist_pct"),
                         "vwap_anchored_dist_pct": c.get("vwap_anchored_dist_pct"),
+                        "zones_ltf":              c.get("zones_ltf"),
+                        "zones_htf":              c.get("zones_htf"),
                         "confluence_score":       c.get("confluence_score"),
                         "confluence_reasons":     c.get("confluence_reasons"),
                         "vol_spike":              c.get("vol_spike"),
@@ -213,7 +241,8 @@ def run_agent(
             signal_id  = f"{c['symbol']}_{timeframe}_{ts_tag}_{event_type}"
 
             if db.get(Signal, signal_id) is None:
-                dq = c.get("data_quality") or {}
+                dq          = c.get("data_quality") or {}
+                prob_success = get_win_rate(db, event_type, timeframe)
                 db.add(Signal(
                     id               = signal_id,
                     symbol           = c["symbol"],
@@ -225,6 +254,7 @@ def run_agent(
                     stop_price       = c["stop_price"],
                     target_price     = c["target_price"],
                     r_multiple       = R_MULTIPLE,
+                    prob_success     = prob_success,
                     status           = "active",
                     context_snapshot = json.dumps({
                         "event_type":              event_type,
@@ -260,6 +290,7 @@ def run_agent(
                     c["symbol"], event_type, direction,
                     c["zone_touches"], c.get("confluence_score", 0),
                 )
+                dispatch_signal(format_alert(c))
 
         # ── 6. Finalise run record and commit ─────────────────────────────────
         valid_setups_count = sum(

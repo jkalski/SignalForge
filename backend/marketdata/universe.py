@@ -19,7 +19,7 @@ SYMBOLS = [
     "XOM", "CVX", "COP", "SLB", "OXY",
 
     # Consumer
-    "AMZN", "HD", "MCD", "NKE", "SBUX", "TGT", "COST", "WMT",
+    "HD", "MCD", "NKE", "SBUX", "TGT", "COST", "WMT",
 
     # Industrials
     "CAT", "DE", "BA", "HON", "GE", "RTX",
@@ -33,12 +33,3 @@ SYMBOLS = [
     # Commodities
     "GLD", "SLV", "USO", "UNG",
 ]
-
-# Deduplicate while preserving order (AMZN appears in tech + consumer)
-_seen: set = set()
-_deduped = []
-for _s in SYMBOLS:
-    if _s not in _seen:
-        _seen.add(_s)
-        _deduped.append(_s)
-SYMBOLS = _deduped

@@ -149,6 +149,9 @@ def align_zones(
         zip(within_tol, nearest_htf_idx, nearest_dist)
     ):
         if is_linked:
+            # Mark the Zone object so downstream callers (scoring, ML) can
+            # use is_htf_confluence without re-querying the alignment dict.
+            ltf_zones[ltf_i].is_htf_confluence = True
             linked.append(
                 {
                     "ltf":      ltf_zones[ltf_i],

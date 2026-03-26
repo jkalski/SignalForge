@@ -77,6 +77,14 @@ from backend.indicators.mtf import (
 from backend.signals.structure_signals import detect_breakout_or_bounce
 from backend.signals.liquidity import detect_liquidity_sweeps
 from backend.signals.scoring import score_setup
+from backend.indicators.daily_levels import get_daily_levels
+from backend.signals.fvg import detect_fvg
+from backend.signals.vwap_signals import detect_vwap_reclaim
+from backend.signals.orb import detect_orb
+from backend.signals.market_structure import detect_bos
+from backend.signals.divergence import detect_rsi_divergence
+from backend.signals.gap import detect_gap
+from backend.signals.bar_patterns import detect_inside_bar, detect_outside_bar, detect_ath_breakout
 
 # Private helpers re-used from the live pipeline (pure, stateless).
 # Importing with underscore names is valid Python; nothing is duplicated.
@@ -125,6 +133,21 @@ class BacktestParams:
     # ── Filters ───────────────────────────────────────────────────────────
     min_confluence_score: int  = 0     # skip setups below this score
     only_active:          bool = False  # if True, skip watchlist setups
+    event_types: Optional[List[str]] = None  # None = all; list = allow-list filter
+
+    # ── Zone method ───────────────────────────────────────────────────────
+    zone_method: str = "pivots"  # "pivots" | "supply_demand"
+
+    # ── Regime filter ─────────────────────────────────────────────────────
+    regime_filter: bool = False   # if True, gate direction by regime_symbol EMA50
+    regime_symbol: str  = "SPY"   # symbol used as regime indicator
+
+    # ── Zone lookback ─────────────────────────────────────────────────────
+    # Caps the rolling window fed to find_pivots / build_zones each bar.
+    # Matches the live pipeline's lookback (200 bars) and turns O(n²)
+    # pivot detection into O(n × zone_lookback), making long runs ~17× faster.
+    # Set to 0 to disable the cap (original expanding-window behaviour).
+    zone_lookback: int = 200
 
     # ── HTF ───────────────────────────────────────────────────────────────
     disable_htf: bool = False  # force no HTF enrichment even if candles given
@@ -151,6 +174,7 @@ def run_backtest(
     candles: List[Dict[str, Any]],
     params: Optional[BacktestParams] = None,
     htf_candles: Optional[List[Dict[str, Any]]] = None,
+    regime_candles: Optional[List[Dict[str, Any]]] = None,
     symbol: str = "",
     timeframe: str = "",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -239,6 +263,24 @@ def run_backtest(
             dtype=np.int64,
         )
 
+    # ── 3b. Prepare regime candles (SPY or other) ─────────────────────────
+    spy_sorted:  Optional[List[Dict]] = None
+    spy_ts_ns:   Optional[np.ndarray] = None
+    spy_ema50:   Optional[np.ndarray] = None
+    spy_closes:  Optional[np.ndarray] = None
+
+    if params.regime_filter and regime_candles and len(regime_candles) >= 50:
+        spy_sorted = sorted(regime_candles, key=lambda x: x["ts"])
+        spy_ts_ns  = np.array(
+            [pd.Timestamp(c["ts"]).value for c in spy_sorted],
+            dtype=np.int64,
+        )
+        spy_df            = pd.DataFrame(spy_sorted)
+        spy_df["close"]   = spy_df["close"].astype(float)
+        spy_df["ema50"]   = spy_df["close"].ewm(span=50, adjust=False).mean()
+        spy_ema50         = spy_df["ema50"].to_numpy(dtype=np.float64)
+        spy_closes        = spy_df["close"].to_numpy(dtype=np.float64)
+
     # ── 4. OHLCV-only view for window slicing ─────────────────────────────
     # find_pivots / zone detection should see only raw OHLCV, not the
     # pre-computed columns added above.
@@ -295,9 +337,27 @@ def run_backtest(
             if htf_end >= _MIN_HTF_BARS:
                 htf_slice = htf_sorted[:htf_end]
 
+        # Regime filter: look up SPY EMA50 at this bar (binary search, O(log n)).
+        regime_bias: Optional[str] = None
+        if spy_sorted is not None:
+            ltf_ts_val  = df["ts"].iloc[i].value
+            spy_idx     = int(np.searchsorted(spy_ts_ns, ltf_ts_val, side="right")) - 1
+            if spy_idx >= 49:  # EMA50 needs 50 bars to warm up
+                sc = spy_closes[spy_idx]
+                se = spy_ema50[spy_idx]
+                if np.isfinite(sc) and np.isfinite(se) and se > 0:
+                    regime_bias = "bullish" if sc > se else "bearish" if sc < se else "neutral"
+
         # Core per-bar analysis (pivots, zones, events, scoring).
+        # Cap the zone-detection window to zone_lookback bars so complexity
+        # stays O(n × zone_lookback) rather than O(n²).  Matches live behaviour
+        # where the agent fetches only the last `lookback` bars from the DB.
+        win_start = (
+            max(0, i + 1 - params.zone_lookback)
+            if params.zone_lookback > 0 else 0
+        )
         result = _run_bar(
-            window     = df_ohlcv.iloc[: i + 1],
+            window     = df_ohlcv.iloc[win_start: i + 1],
             atr        = atr,
             close_i    = close_i,
             vol_spike  = vol_spike,
@@ -316,7 +376,15 @@ def run_backtest(
             continue
         if params.only_active and result["signal_status"] != "active":
             continue
+        if params.event_types and result["event_type"] not in params.event_types:
+            continue
+        if regime_bias is not None:
+            if regime_bias == "bearish" and result["direction"] == "long":
+                continue
+            if regime_bias == "bullish" and result["direction"] == "short":
+                continue
 
+        result["regime_bias"] = regime_bias
         result["bar_index"] = i
         result["symbol"]    = symbol
         result["timeframe"] = timeframe
@@ -427,11 +495,20 @@ def _run_bar(
         window_piv.iloc[-params.pivot_order:, pl_col] = False
 
     # ── Step 7: LTF zone clustering ───────────────────────────────────────
-    ltf_zones = build_zones_from_pivots(
-        window_piv, zone_tol=zone_tol, min_touches=params.min_zone_touches
-    )
+    if params.zone_method == "supply_demand":
+        from backend.indicators.sd_zones import build_sd_zones
+        ltf_zones = build_sd_zones(window_piv, zone_tol=zone_tol, atr=atr)
+    else:
+        ltf_zones = build_zones_from_pivots(
+            window_piv, zone_tol=zone_tol, min_touches=params.min_zone_touches
+        )
     if not ltf_zones:
         return None
+
+    # ── Step 7.5: merge PDH/PDL zones ─────────────────────────────────────
+    pdh_pdl = get_daily_levels(window_piv, zone_tol)
+    if pdh_pdl:
+        ltf_zones = ltf_zones + pdh_pdl
 
     # ── Step 8: HTF zones + bias (optional) ──────────────────────────────
     htf_zones: List[Zone] = []
@@ -467,9 +544,13 @@ def _run_bar(
             htf_df.iloc[-params.pivot_order:, pl_col] = False
         htf_df    = add_trend_filter(htf_df)
         htf_tol   = htf_atr * params.zone_atr_mult
-        htf_zones = build_zones_from_pivots(
-            htf_df, zone_tol=htf_tol, min_touches=params.min_zone_touches
-        )
+        if params.zone_method == "supply_demand":
+            from backend.indicators.sd_zones import build_sd_zones
+            htf_zones = build_sd_zones(htf_df, zone_tol=htf_tol, atr=htf_atr)
+        else:
+            htf_zones = build_zones_from_pivots(
+                htf_df, zone_tol=htf_tol, min_touches=params.min_zone_touches
+            )
         htf_bias  = get_htf_bias(htf_df)
 
         if htf_zones:
@@ -479,6 +560,7 @@ def _run_bar(
     # ── Step 9: VWAP (volume-gated) ───────────────────────────────────────
     vwap_session_dist_pct  = None
     vwap_anchored_dist_pct = None
+    df_v: Optional[pd.DataFrame] = None   # carries vwap_session column when computed
 
     if volume_ok:
         df_v = add_session_vwap(window_piv)
@@ -502,17 +584,45 @@ def _run_bar(
     # ── Step 10: nearby-zone selection (caps O(n×zones)) ─────────────────
     nearby = _select_nearby(ltf_zones, close_i, params.max_nearby_zones)
 
-    # ── Step 11: event detection — sweeps first, then structural ──────────
+    # ── Step 11: event detection ──────────────────────────────────────────
     event: Optional[Dict] = None
-    sweep = detect_liquidity_sweeps(
-        window_piv, nearby, zone_tol, lookback_bars=params.sweep_lookback
-    )
-    if sweep is not None:
-        event = sweep
-    else:
-        struct = detect_breakout_or_bounce(window_piv, nearby, zone_tol)
-        if struct is not None:
-            event = struct
+
+    # Gap fades run first — a gap-open reversal is more specific than a
+    # generic bounce/sweep and should not be overridden by zone signals.
+    gap = detect_gap(window_piv, atr)
+    if gap is not None and gap["type"] in ("gap_fade_long", "gap_fade_short"):
+        event = gap
+
+    if event is None:
+        event = detect_ath_breakout(window_piv, zone_tol)
+
+    if event is None:
+        sweep = detect_liquidity_sweeps(
+            window_piv, nearby, zone_tol, lookback_bars=params.sweep_lookback
+        )
+        if sweep is not None:
+            event = sweep
+        else:
+            struct = detect_breakout_or_bounce(window_piv, nearby, zone_tol)
+            if struct is not None:
+                event = struct
+
+    # Extended detectors — run only when no primary event found yet.
+    if event is None:
+        event = detect_fvg(window_piv, zone_tol, atr)
+    if event is None and df_v is not None:
+        event = detect_vwap_reclaim(df_v, atr)   # df_v has vwap_session column
+    if event is None:
+        event = detect_bos(window_piv, zone_tol)
+    if event is None:
+        event = detect_orb(window_piv, atr, zone_tol)
+    if event is None:
+        event = detect_outside_bar(window_piv)
+    if event is None:
+        event = detect_inside_bar(window_piv)
+    # Gap continuations: lowest priority (similar confidence to breakouts).
+    if event is None and gap is not None:
+        event = gap
 
     if event is None:
         return None
@@ -522,6 +632,13 @@ def _run_bar(
     ema_confirms = bool(
         (direction == "long"  and trend_bull) or
         (direction == "short" and trend_bear)
+    )
+
+    # RSI divergence confluence gate.
+    rsi_div = detect_rsi_divergence(window_piv)
+    rsi_divergence_aligned = bool(
+        (rsi_div == "bullish" and direction == "long") or
+        (rsi_div == "bearish" and direction == "short")
     )
 
     ltf_trend_aligned  = ema_confirms
@@ -562,6 +679,7 @@ def _run_bar(
         htf_bias_aligned       = (htf_trend_aligned is True),
         near_htf_zone          = near_htf,
         ref_ts                 = bar_ts,
+        rsi_divergence_aligned = rsi_divergence_aligned,
     )
 
     # ── Step 14: position sizing ──────────────────────────────────────────
@@ -1049,6 +1167,18 @@ def _parse_args() -> argparse.Namespace:
                     help="Skip setups below this confluence score (default 0)")
     g2.add_argument("--only-active",     action="store_true",
                     help="Skip watchlist setups (all gates must pass)")
+    g2.add_argument("--event-types",     default=None,
+                    help="Comma-separated allow-list of event types, e.g. "
+                         "sweep_up,sweep_down,bounce_up,reject_down "
+                         "(default: all event types)")
+    g2.add_argument("--zone-method",     default="pivots",
+                    choices=["pivots", "supply_demand"],
+                    help="Zone detection method: pivots (default) or supply_demand")
+    g2.add_argument("--regime-filter",   action="store_true",
+                    help="Gate signal direction by regime symbol EMA50 "
+                         "(skip counter-trend signals)")
+    g2.add_argument("--regime-symbol",   default="SPY",
+                    help="Ticker used as regime filter (default: SPY)")
     g2.add_argument("--no-htf",          action="store_true",
                     help="Disable HTF enrichment")
     g2.add_argument("--entry-mode",      default="enter_on_close",
@@ -1090,6 +1220,10 @@ if __name__ == "__main__":
         outcome_horizon_bars = args.horizon,
         min_confluence_score = args.min_score,
         only_active          = args.only_active,
+        event_types          = [e.strip() for e in args.event_types.split(",")] if args.event_types else None,
+        zone_method          = args.zone_method,
+        regime_filter        = args.regime_filter,
+        regime_symbol        = args.regime_symbol,
         disable_htf          = args.no_htf,
         entry_mode           = args.entry_mode,
         slippage_bps         = args.slippage_bps,
@@ -1108,6 +1242,15 @@ if __name__ == "__main__":
             source    = args.source,
             lookback  = args.lookback or 999_999,
         )
+        regime_candles = None
+        if args.regime_filter and args.regime_symbol.upper() != args.symbol.upper():
+            regime_candles = _fetch_candles(
+                db        = db,
+                symbol    = args.regime_symbol.upper(),
+                timeframe = args.timeframe,
+                source    = args.source,
+                lookback  = args.lookback or 999_999,
+            )
     finally:
         db.close()
 
@@ -1164,10 +1307,11 @@ if __name__ == "__main__":
                 )
     else:
         setups, summary = run_backtest(
-            candles   = candles,
-            params    = params,
-            symbol    = args.symbol.upper(),
-            timeframe = args.timeframe,
+            candles        = candles,
+            params         = params,
+            regime_candles = regime_candles,
+            symbol         = args.symbol.upper(),
+            timeframe      = args.timeframe,
         )
 
         save_results(setups, summary, args.out)

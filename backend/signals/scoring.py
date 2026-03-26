@@ -61,6 +61,24 @@ _W_MTF    = 10
 
 assert _W_ZONE + _W_VOLUME + _W_EVENT + _W_EMA + _W_VWAP + _W_MTF == 100
 
+# ---------------------------------------------------------------------------
+# Event-type sets (module-level constants — avoids re-creating sets on every call)
+# ---------------------------------------------------------------------------
+
+_SWEEP_EVENTS       = frozenset({"sweep_up", "sweep_down"})
+_STRUCTURAL_EVENTS  = frozenset({"bounce_up", "reject_down"})
+_BREAKOUT_EVENTS    = frozenset({"breakout_up", "breakdown_down"})
+_BOS_EVENTS         = frozenset({"bos_up", "bos_down", "choch_up", "choch_down"})
+_FVG_EVENTS         = frozenset({"fvg_long", "fvg_short"})
+_VWAP_EVENTS        = frozenset({"vwap_reclaim_long", "vwap_reclaim_short"})
+_ORB_EVENTS         = frozenset({"orb_long", "orb_short"})
+_GAP_FADE_EVENTS    = frozenset({"gap_fade_long", "gap_fade_short"})
+_GAP_GO_EVENTS      = frozenset({"gap_go_long", "gap_go_short"})
+_OUTSIDE_BAR_EVENTS = frozenset({"outside_bar_long", "outside_bar_short"})
+_INSIDE_BAR_EVENTS  = frozenset({"inside_bar_long", "inside_bar_short"})
+_DOUBLE_IB_EVENTS   = frozenset({"double_inside_bar_long", "double_inside_bar_short"})
+_ATH_EVENTS         = frozenset({"ath_breakout_long"})
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -79,6 +97,7 @@ def score_setup(
     htf_bias_aligned: bool = False,
     near_htf_zone: bool = False,
     ref_ts: Optional[pd.Timestamp] = None,
+    rsi_divergence_aligned: bool = False,
 ) -> Dict[str, Any]:
     """
     Compute a 0-100 confluence score for a single setup.
@@ -120,6 +139,9 @@ def score_setup(
         Timestamp of the triggering bar.  Used to compute zone recency (age
         in calendar days since ``zone.last_ts``).  When ``None``, age is
         assumed to be 0 days (maximum recency score).
+    rsi_divergence_aligned : bool, default False
+        True when RSI divergence (bullish/bearish) agrees with signal direction.
+        Awards a bonus 8 pts (additive; final score capped at 100).
 
     Returns
     -------
@@ -142,6 +164,7 @@ def score_setup(
     ema_detail    = _score_ema(ltf_trend_aligned, htf_trend_aligned)
     vwap_detail   = _score_vwap(vwap_session_dist_pct, vwap_anchored_dist_pct)
     mtf_detail    = _score_mtf(htf_bias_aligned, near_htf_zone)
+    div_detail    = _score_divergence(rsi_divergence_aligned)
 
     raw = (
         zone_detail["score"]
@@ -150,17 +173,19 @@ def score_setup(
         + ema_detail["score"]
         + vwap_detail["score"]
         + mtf_detail["score"]
+        + div_detail["score"]
     )
 
     return {
         "score": min(raw, 100),
         "reasons": {
-            "zone":   zone_detail,
-            "volume": volume_detail,
-            "event":  event_detail,
-            "ema":    ema_detail,
-            "vwap":   vwap_detail,
-            "mtf":    mtf_detail,
+            "zone":        zone_detail,
+            "volume":      volume_detail,
+            "event":       event_detail,
+            "ema":         ema_detail,
+            "vwap":        vwap_detail,
+            "mtf":         mtf_detail,
+            "divergence":  div_detail,
         },
     }
 
@@ -258,16 +283,24 @@ def _score_event(event_type: str) -> Dict:
     Confirmed breakouts rank third — valid but wider stops and more false
     positives in choppy conditions.
     """
-    _SWEEP_EVENTS      = {"sweep_up", "sweep_down"}
-    _STRUCTURAL_EVENTS = {"bounce_up", "reject_down"}
-    _BREAKOUT_EVENTS   = {"breakout_up", "breakdown_down"}
-
     if event_type in _SWEEP_EVENTS:
         pts = 10
+    elif event_type in _ATH_EVENTS:
+        pts = 9   # uncharted territory — no overhead supply, momentum can exceed targets
     elif event_type in _STRUCTURAL_EVENTS:
         pts = 8
-    elif event_type in _BREAKOUT_EVENTS:
+    elif event_type in _GAP_FADE_EVENTS:
+        pts = 8   # gap fades are high-probability mean-reversion setups
+    elif event_type in _DOUBLE_IB_EVENTS:
+        pts = 9   # 2+ inside bars = stronger consolidation, more explosive breakout
+    elif event_type in _BREAKOUT_EVENTS or event_type in _GAP_GO_EVENTS:
         pts = 6
+    elif event_type in _BOS_EVENTS or event_type in _FVG_EVENTS:
+        pts = 7   # strong structural/imbalance signals
+    elif event_type in _OUTSIDE_BAR_EVENTS or event_type in _INSIDE_BAR_EVENTS:
+        pts = 7   # engulfing / single inside bar breakout — pattern-based confirmation
+    elif event_type in _VWAP_EVENTS or event_type in _ORB_EVENTS:
+        pts = 5   # session-context signals — valid but lower base confidence
     else:
         pts = 0
 
@@ -375,6 +408,26 @@ def _score_mtf(htf_bias_aligned: bool, near_htf_zone: bool) -> Dict:
         "max":              _W_MTF,
         "htf_bias_aligned": htf_bias_aligned,
         "near_htf_zone":    near_htf_zone,
+    }
+
+
+def _score_divergence(aligned: bool) -> Dict:
+    """
+    RSI divergence confluence bonus (8 pts max).
+
+    When RSI divergence is present AND agrees with the signal direction, it
+    represents a meaningful momentum confirmation that deserves extra weight.
+    This is additive: the total score can reach 108 pts but is capped at 100
+    by score_setup().
+
+    8 pts chosen to match the MTF bucket weight — divergence is roughly as
+    meaningful as HTF zone confluence but less universal (depends on pivot data).
+    """
+    pts = 8 if aligned else 0
+    return {
+        "score":   pts,
+        "max":     8,
+        "aligned": aligned,
     }
 
 
