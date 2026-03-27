@@ -98,6 +98,7 @@ def score_setup(
     near_htf_zone: bool = False,
     ref_ts: Optional[pd.Timestamp] = None,
     rsi_divergence_aligned: bool = False,
+    asset_type: str = "stock",
 ) -> Dict[str, Any]:
     """
     Compute a 0-100 confluence score for a single setup.
@@ -160,7 +161,7 @@ def score_setup(
 
     zone_detail   = _score_zone(zone, atr14, ref_ts)
     volume_detail = _score_volume(vol_ratio)
-    event_detail  = _score_event(event["type"])
+    event_detail  = _score_event(event["type"], asset_type)
     ema_detail    = _score_ema(ltf_trend_aligned, htf_trend_aligned)
     vwap_detail   = _score_vwap(vwap_session_dist_pct, vwap_anchored_dist_pct)
     mtf_detail    = _score_mtf(htf_bias_aligned, near_htf_zone)
@@ -273,34 +274,52 @@ def _score_volume(vol_ratio: Optional[float]) -> Dict:
     }
 
 
-def _score_event(event_type: str) -> Dict:
+def _score_event(event_type: str, asset_type: str = "stock") -> Dict:
     """
-    Event type base score (10 pts max).
+    Event type base score (10 pts max), adjusted by asset type.
 
-    Sweep reversals rank highest: they offer the tightest invalidation
-    (stop just beyond the sweep wick) and the cleanest R:R.
-    Structural tests (bounce / rejection) rank second.
-    Confirmed breakouts rank third — valid but wider stops and more false
-    positives in choppy conditions.
+    ETFs are mean-reverting baskets — gap fades, structural bounces, and
+    VWAP reclaims work best. ATH breakouts and gap-and-go are low-signal
+    because indexes are designed to grind to new highs over time.
+
+    Stocks have catalyst-driven momentum — sweeps, ATH breakouts, and
+    gap-and-go work best. Gap fades are less reliable on individual names.
     """
+    is_etf = (asset_type == "etf")
+
     if event_type in _SWEEP_EVENTS:
-        pts = 10
-    elif event_type in _ATH_EVENTS:
-        pts = 9   # uncharted territory — no overhead supply, momentum can exceed targets
-    elif event_type in _STRUCTURAL_EVENTS:
-        pts = 8
+        pts = 7 if is_etf else 10      # ETFs: less liquidity-grab dynamic
+
     elif event_type in _GAP_FADE_EVENTS:
-        pts = 8   # gap fades are high-probability mean-reversion setups
+        pts = 10 if is_etf else 5      # ETFs: basket rebalancing makes gaps fill reliably
+
+    elif event_type in _STRUCTURAL_EVENTS:
+        pts = 9 if is_etf else 8       # ETFs: strong mean-reversion at key levels
+
+    elif event_type in _VWAP_EVENTS:
+        pts = 8 if is_etf else 5       # ETFs: VWAP is heavily used by institutional algos
+
+    elif event_type in _ATH_EVENTS:
+        pts = 2 if is_etf else 10      # ETFs: always making ATHs — very low signal
+
+    elif event_type in _GAP_GO_EVENTS:
+        pts = 2 if is_etf else 9       # ETFs: rarely gap-and-go cleanly without a catalyst
+
     elif event_type in _DOUBLE_IB_EVENTS:
-        pts = 9   # 2+ inside bars = stronger consolidation, more explosive breakout
-    elif event_type in _BREAKOUT_EVENTS or event_type in _GAP_GO_EVENTS:
-        pts = 6
+        pts = 8 if is_etf else 9       # valid on both, slightly stronger on stocks
+
     elif event_type in _BOS_EVENTS or event_type in _FVG_EVENTS:
-        pts = 7   # strong structural/imbalance signals
+        pts = 5 if is_etf else 7       # structural signals less crisp on diversified baskets
+
+    elif event_type in _BREAKOUT_EVENTS:
+        pts = 5 if is_etf else 6       # ETFs break out but don't run as hard
+
     elif event_type in _OUTSIDE_BAR_EVENTS or event_type in _INSIDE_BAR_EVENTS:
-        pts = 7   # engulfing / single inside bar breakout — pattern-based confirmation
-    elif event_type in _VWAP_EVENTS or event_type in _ORB_EVENTS:
-        pts = 5   # session-context signals — valid but lower base confidence
+        pts = 6 if is_etf else 7
+
+    elif event_type in _ORB_EVENTS:
+        pts = 6 if is_etf else 5       # ORB works well on ETFs (SPY/QQQ range days)
+
     else:
         pts = 0
 
@@ -308,6 +327,7 @@ def _score_event(event_type: str) -> Dict:
         "score":      pts,
         "max":        _W_EVENT,
         "event_type": event_type,
+        "asset_type": asset_type,
     }
 
 

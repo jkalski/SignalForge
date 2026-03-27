@@ -73,6 +73,7 @@ from backend.signals.divergence import detect_rsi_divergence
 from backend.signals.gap import detect_gap
 from backend.signals.bar_patterns import detect_inside_bar, detect_outside_bar, detect_ath_breakout
 from backend.ml.predictor import get_predictor
+from backend.marketdata.universe import get_asset_type
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +337,7 @@ def run_structure_pipeline(
         if vol_sma and vol_sma > 0 and not pd.isna(last["volume"])
         else None
     )
+    rvol = round(float(last["rvol"]), 2) if "rvol" in last.index and not pd.isna(last["rvol"]) else None
 
     trend_bull = bool(last["trend_bull"])
     trend_bear = bool(last["trend_bear"])
@@ -399,6 +401,7 @@ def run_structure_pipeline(
         near_htf_zone          = near_htf,
         ref_ts                 = df["ts"].iloc[-1],
         rsi_divergence_aligned = rsi_divergence_aligned,
+        asset_type             = get_asset_type(symbol),
     )
     confluence_score   = confluence_result["score"]
     confluence_reasons = confluence_result["reasons"]
@@ -467,6 +470,7 @@ def run_structure_pipeline(
         # Volume
         "vol_spike":       vol_spike,
         "vol_ratio":       vol_ratio,
+        "rvol":            rvol,
         # Trend
         "trend":           trend,
         "ema_confirms":    ema_confirms,
@@ -502,6 +506,8 @@ def run_structure_pipeline(
         "confluence_reasons": confluence_reasons,
         # Signal status
         "signal_status":   signal_status,
+        # Asset classification
+        "asset_type":      get_asset_type(symbol),
         # ML probability (None until model is trained)
         "ml_probability":  ml_probability,
         # Data quality

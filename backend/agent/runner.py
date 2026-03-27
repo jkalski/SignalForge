@@ -72,8 +72,8 @@ _SCAN_WORKERS = 8
 _HTF_MAP: Dict[str, str] = {
     "1m":  "15m",
     "5m":  "1h",
-    "15m": "4h",
-    "1h":  "4h",
+    "15m": "1h",
+    "1h":  "1d",
     "4h":  "1d",
     "1d":  "1w",
 }
@@ -222,7 +222,7 @@ def run_agent(
                         "ema_confirms":           c.get("ema_confirms"),
                         "signal_status":          c.get("signal_status"),
                         "data_quality":           dq_setup,
-                    }),
+                    }, default=str),
                     created_at    = datetime.now(UTC),
                 ))
 
@@ -281,7 +281,7 @@ def run_agent(
                         "vwap_anchored_dist_pct":  c.get("vwap_anchored_dist_pct"),
                         "data_quality":            dq,
                         "source":                  source,
-                    }),
+                    }, default=str),
                     created_at = datetime.now(UTC),
                 ))
                 signals_created += 1
@@ -392,15 +392,17 @@ def _scan_one_symbol(
             dq = result.get("data_quality") or {}
             dq["htf_timeframe"]  = htf_tf
             dq["htf_bars_count"] = len(htf_candles)
-            dq["htf_last_ts"]    = htf_candles[-1]["ts"] if htf_candles else None
+            dq["htf_last_ts"]    = str(htf_candles[-1]["ts"]) if htf_candles else None
             dq["htf_provider"]   = source or "unknown"
             result["data_quality"] = dq
             logger.debug(
-                "%-6s | %-15s | zones=%-2d | htf_zones=%d | vol=%-5s | trend=%-7s | conf=%.2f | %dms",
+                "%-6s | %-15s | zones=%-2d | htf_zones=%d | vol=%-5s | rvol=%-4s | score=%-3s | trend=%-7s | %dms",
                 symbol, result["event_type"], result["zones_detected"],
                 result["zones_htf_count"],
-                result["vol_spike"], result["trend"],
-                result["confidence"], elapsed_ms,
+                "spike" if result["vol_spike"] else "low",
+                result.get("rvol") or "?",
+                result.get("confluence_score") or "?",
+                result["trend"], elapsed_ms,
             )
         else:
             logger.debug(

@@ -84,8 +84,19 @@ def get_latest_setups(
         if signal_status:
             q = q.filter(Setup.signal_status == signal_status)
 
-        rows = q.order_by(Setup.ts.desc(), Setup.score.asc()).limit(limit).all()
-        return [_row_to_dict(r) for r in rows]
+        rows = q.order_by(Setup.created_at.desc()).all()
+
+        # Keep only the most recent setup per symbol
+        seen: set = set()
+        deduped = []
+        for r in rows:
+            if r.symbol not in seen:
+                seen.add(r.symbol)
+                deduped.append(r)
+            if len(deduped) >= limit:
+                break
+
+        return [_row_to_dict(r) for r in deduped]
 
     finally:
         db.close()
